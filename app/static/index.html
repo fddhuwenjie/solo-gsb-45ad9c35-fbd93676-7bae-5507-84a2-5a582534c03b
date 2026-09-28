@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>水下声呐测线覆盖复核</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>水下声呐测线覆盖复核</h1>
+    <p class="subtitle">粘贴任务边界与测线 JSON · 自动识别未覆盖缺口 / 边界外扫掠 / 相邻测线过度重叠 · 每个问题附可复核的计算依据</p>
+  </header>
+
+  <main>
+    <section class="panel input-panel">
+      <div class="panel-title">
+        <h2>任务输入（JSON）</h2>
+        <div class="btn-row">
+          <button id="btn-sample" type="button">载入示例</button>
+          <button id="btn-analyze" type="button" class="primary">开始复核</button>
+        </div>
+      </div>
+      <textarea id="input-json" spellcheck="false" placeholder='{"boundary": {...}, "lines": [...], "options": {...}}'></textarea>
+      <div id="input-status" class="status"></div>
+      <details class="help">
+        <summary>输入格式说明</summary>
+        <pre>{
+  "boundary": { "type": "Polygon",
+    "coordinates": [[[x,y],[x,y],...]] },
+  "lines": [
+    { "id": "L1", "start": [x,y],
+      "end": [x,y], "swath": 90 }
+  ],
+  "options": {
+    "min_issue_area": 1.0,
+    "max_overlap_ratio": 0.2
+  }
+}</pre>
+        <ul>
+          <li>坐标为平面坐标（如局部网格/投影坐标，单位通常为米），长度面积单位与之一致。</li>
+          <li>测线按记录顺序排列，重叠检查针对相邻两条（L<sub>i</sub> 与 L<sub>i+1</sub>）。</li>
+          <li>扫掠区 = 测线按半扫宽（swath/2）缓冲、平头端帽。</li>
+          <li>修改输入后约 0.7s 自动重新复核，结果确定性更新。</li>
+        </ul>
+      </details>
+    </section>
+
+    <section class="panel result-panel">
+      <div class="panel-title">
+        <h2>复核结果</h2>
+        <div class="btn-row">
+          <button id="btn-export" type="button" disabled>导出结果 JSON</button>
+        </div>
+      </div>
+
+      <div id="error-banner" class="error-banner" hidden></div>
+
+      <div id="summary" class="summary"></div>
+
+      <div class="canvas-wrap">
+        <canvas id="map"></canvas>
+        <div class="legend">
+          <span><i class="sw boundary"></i>任务边界</span>
+          <span><i class="sw coverage"></i>扫掠覆盖</span>
+          <span><i class="sw line"></i>测线</span>
+          <span><i class="sw gap"></i>缺口</span>
+          <span><i class="sw outside"></i>越界</span>
+          <span><i class="sw overlap"></i>重叠</span>
+          <span><i class="sw event"></i>连续性事件</span>
+          <span><i class="sw closure"></i>水深交点</span>
+        </div>
+        <div class="canvas-hint">滚轮缩放 · 拖拽平移 · 双击复位 · 点击问题卡片定位</div>
+      </div>
+
+      <div class="filter-bar" id="filter-bar"></div>
+      <div id="issue-list" class="issue-list"></div>
+
+      <details class="line-stats-wrap">
+        <summary>逐测线统计</summary>
+        <table id="line-stats" class="line-stats"></table>
+      </details>
+    </section>
+  </main>
+
+  <section class="panel continuity-panel">
+    <div class="panel-title">
+      <h2>采集连续性检查</h2>
+      <div class="btn-row">
+        <button id="btn-ct-sample" type="button">载入示例</button>
+        <button id="btn-ct-run" type="button" class="primary">开始检查</button>
+        <button id="btn-ct-export" type="button" disabled>导出结果 JSON</button>
+      </div>
+    </div>
+    <p class="ct-note">
+      粘贴<b>按采集顺序排列</b>的样本 JSON（数组或含 <code>samples</code> 的对象）；计划测线沿用上方任务输入中的
+      <code>lines</code>。事件轨迹以青色叠加在上方画布，点击事件卡片自动定位。
+    </p>
+    <div class="ct-grid">
+      <div class="ct-input-col">
+        <div class="ct-thresholds">
+          <label>最大采样间隔 (s)
+            <input id="ct-max-gap" type="number" value="8" min="0.001" step="0.5">
+          </label>
+          <label>最大速度 (坐标单位/s)
+            <input id="ct-max-speed" type="number" value="15" min="0.001" step="1">
+          </label>
+          <label>偏离容差 (坐标单位)
+            <input id="ct-max-offset" type="number" value="20" min="0" step="1">
+          </label>
+        </div>
+        <textarea id="ct-input" spellcheck="false"
+          placeholder='[{"line_id":"L1","timestamp":0,"ping_seq":1,"x":0,"y":45}, …]'></textarea>
+        <div id="ct-status" class="status"></div>
+        <details class="help">
+          <summary>样本格式与检查规则</summary>
+          <pre>[
+  { "line_id": "L1", "timestamp": 0, "ping_seq": 1,
+    "x": 0, "y": 45 },
+  ...
+]</pre>
+          <ul>
+            <li>样本必须按采集顺序排列，后端不做重排；索引为 0-based 原始输入顺序。</li>
+            <li>顺序检查：相邻样本时间倒退；同一测线内 ping_seq 重复或非 +1 跳变（换线重新计数属正常）。</li>
+            <li>区间检查（仅同测线且时间严格递增的相邻样本间）：间隔 &gt; 最大采样间隔、速度 &gt; 最大速度、到计划测线（start-end 线段）的距离 &gt; 偏离容差。</li>
+            <li>相邻异常区间合并为事件：不跨测线、不跨时间倒退点；同一区间命中多条规则时原因全部保留。</li>
+            <li>样本/阈值修改后约 0.7s 自动重新检查；任务输入中的测线变化后也会自动重查。</li>
+          </ul>
+        </details>
+      </div>
+      <div class="ct-result-col">
+        <div id="ct-summary" class="summary"></div>
+        <div class="filter-bar" id="ct-line-filter"></div>
+        <div class="filter-bar" id="ct-reason-filter"></div>
+        <div id="ct-events" class="issue-list"></div>
+        <details class="line-stats-wrap">
+          <summary>逐测线统计</summary>
+          <table id="ct-line-stats" class="line-stats"></table>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel closure-panel">
+    <div class="panel-title">
+      <h2>交叉点水深闭合</h2>
+      <div class="btn-row">
+        <button id="btn-cl-sample" type="button">载入示例</button>
+        <button id="btn-cl-run" type="button" class="primary">开始闭合</button>
+        <button id="btn-cl-export" type="button" disabled>导出结果 JSON</button>
+      </div>
+    </div>
+    <p class="ct-note">
+      粘贴<b>按采集顺序排列</b>的水深样本 JSON（数组或含 <code>samples</code> 的对象，样本含
+      <code>line_id / x / y / depth</code>）；计划测线沿用上方任务输入中的 <code>lines</code>。
+      仅处理两条计划线的<b>点状交点</b>：每线按原始顺序寻找投影里程跨过交点、
+      两端投影里程到交点里程的绝对差（沿线距离）均不超过包围距离的同线相邻样本，按里程线性插值水深；
+      交点水深差建立偏置方程网，Huber 迭代加权最小二乘估计测线偏置。有效交点以彩色圆点叠加在上方画布。
+    </p>
+    <div class="ct-grid">
+      <div class="ct-input-col">
+        <div class="ct-thresholds">
+          <label>包围距离 (坐标单位)
+            <input id="cl-max-enclosure" type="number" value="15" min="0.001" step="1">
+          </label>
+          <label>Huber 阈值 δ
+            <input id="cl-huber-delta" type="number" value="0.3" min="0.001" step="0.05">
+          </label>
+          <label>校正残差阈值
+            <input id="cl-residual" type="number" value="0.5" min="0" step="0.05">
+          </label>
+        </div>
+        <textarea id="cl-input" spellcheck="false"
+          placeholder='[{"line_id":"H1","x":0,"y":120,"depth":20.0}, …]'></textarea>
+        <div id="cl-status" class="status"></div>
+        <details class="help">
+          <summary>样本格式与计算规则</summary>
+          <pre>[
+  { "line_id": "H1", "x": 0, "y": 120, "depth": 20.0 },
+  ...
+]</pre>
+          <ul>
+            <li>样本必须按采集顺序排列，后端不做重排；端点索引为 0-based 原始顺序。</li>
+            <li>仅处理两条计划线的点状交点；共线/重叠线整对跳过并说明原因。</li>
+            <li>每线寻找投影里程跨过交点、两端投影里程到交点里程的绝对差（沿线距离）均 ≤ 包围距离的同线相邻样本对（端点贴近测线但沿线离交点过远同样超距拒绝，横向投影距离不参与判限）；多组候选取两端沿线距离之和最小者，再以原始索引破同值；水深按里程线性插值。</li>
+            <li>偏置方程 b₁−b₂ = d₂−d₁，每连通分量固定字典序最小测线偏置为零，NumPy Huber IRLS 求解；观测数 = 节点数−1 的分量标“无冗余不可判”，其余按 |校正残差| 与阈值判定。</li>
+            <li>样本/阈值修改后约 0.7s 自动重新闭合；任务输入中的测线变化后也会自动重算。</li>
+          </ul>
+        </details>
+      </div>
+      <div class="ct-result-col">
+        <div id="cl-summary" class="summary"></div>
+        <div class="filter-bar" id="cl-status-filter"></div>
+        <div class="filter-bar" id="cl-line-filter"></div>
+        <div id="cl-list" class="issue-list"></div>
+        <details class="line-stats-wrap">
+          <summary>测线偏置与连通分量</summary>
+          <table id="cl-line-biases" class="line-stats"></table>
+          <div id="cl-components"></div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
