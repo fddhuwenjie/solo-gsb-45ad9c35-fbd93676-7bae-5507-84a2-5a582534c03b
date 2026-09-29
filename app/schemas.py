@@ -110,3 +110,34 @@ class ClosureRequest(BaseModel):
         description="水深采集样本（含 depth），必须按采集顺序排列，后端不做任何重排",
     )
     options: ClosureOptions = Field(default_factory=ClosureOptions)
+
+
+class SoundSpeedLayer(BaseModel):
+    """一个声速层：深度区间 [top_depth, bottom_depth] 内声速恒定为 sound_speed。"""
+
+    top_depth: float = Field(ge=0, description="层顶深度（≥0，自海表面向下为正）")
+    bottom_depth: float = Field(description="层底深度（必须严格大于 top_depth）")
+    sound_speed: float = Field(gt=0, description="该层内恒定声速（长度/秒，与坐标长度单位一致）")
+
+
+class RayBeam(BaseModel):
+    """一个多波束波束：换能器位置/朝向 + 双程传播时间 + 相对垂直方向的有符号入射角。"""
+
+    id: str | None = Field(default=None, max_length=64, description="可选波束编号；缺省按输入顺序生成 B-001…")
+    x: float = Field(description="换能器平面坐标 x")
+    y: float = Field(description="换能器平面坐标 y")
+    heading: float = Field(description="航向角（度，自正北顺时针；用于把右舷横距换算为平面位移）")
+    transducer_depth: float = Field(description="换能器深度（自海表面向下为正；必须落在某一声速层内）")
+    two_way_travel_time: float = Field(ge=0, description="双程传播时间（秒），后端取其一半作为单程时间")
+    angle_deg: float = Field(ge=-90, le=90, description="相对垂直方向的有符号入射角（度），正角指右舷")
+
+
+class RayCorrectionRequest(BaseModel):
+    profile: list[SoundSpeedLayer] = Field(
+        min_length=1, max_length=200,
+        description="分层声速剖面：各层不得重叠，允许存在断档（射线进入断档时该波束失败，禁止外推）",
+    )
+    beams: list[RayBeam] = Field(
+        default_factory=list, max_length=50000,
+        description="待改正波束，按输入顺序处理与编号，后端不做任何重排",
+    )

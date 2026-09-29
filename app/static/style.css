@@ -11,6 +11,8 @@
   --overlap: #a371f7;
   --event: #22d3ee;
   --closure: #fde047;
+  --ray: #3fb950;
+  --ray-straight: #f5a524;
   --ok: #3fb950;
 }
 
@@ -172,6 +174,15 @@ textarea:focus { outline: none; border-color: var(--accent); }
 .sw.overlap { background: var(--overlap); }
 .sw.event { background: var(--event); }
 .sw.closure { background: var(--closure); }
+.sw.ray { background: var(--ray); }
+.sw.ray-straight {
+  background: transparent;
+  border: 2px dashed var(--ray-straight);
+  width: 8px;
+  height: 8px;
+  transform: rotate(45deg);
+  border-radius: 1px;
+}
 
 .canvas-hint {
   position: absolute;
@@ -379,3 +390,62 @@ textarea:focus { outline: none; border-color: var(--accent); }
 }
 .cl-comp b { color: var(--text); }
 
+
+/* ---------------- 声速射线改正面板 ---------------- */
+.ray-panel { margin: 0 24px 24px; }
+.rc-label {
+  display: block;
+  margin: 6px 0 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.rc-label code {
+  background: #0b1119;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 11.5px;
+}
+.rc-area { min-height: 150px; }
+.rc-beams { min-height: 230px; }
+
+.issue-card.rc-ok { border-left-color: var(--ray); }
+.issue-card.rc-failed { border-left-color: var(--gap); }
+.chip.rc-ok { color: #9be8a6; border-color: var(--ray); }
+.chip.rc-failed { color: #ffb4b6; border-color: var(--gap); background: rgba(229,72,77,0.15); }
+.chip.rc-reason { color: #ffd9a0; border-color: var(--ray-straight); }
+
+.rc-seg-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 4px 0;
+  font-size: 11.5px;
+}
+.rc-seg-table th, .rc-seg-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 2px 6px 2px 0;
+  color: var(--muted);
+  text-align: right;
+}
+.rc-seg-table th:first-child, .rc-seg-table td:first-child { text-align: left; color: #9db2c8; }
+.rc-seg-table th { font-weight: 500; }
+.rc-seg-table tr.partial td { color: #cfe8ff; }
+
+.rc-rayview-wrap {
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--panel-2);
+}
+.rc-rayview-wrap .panel-title { margin-bottom: 6px; }
+.rc-rayview-wrap h2 { font-size: 13.5px; }
+#rc-rayview {
+  display: block;
+  width: 100%;
+  height: 340px;
+  background: #0b1119;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.rc-rayview-hint { margin-top: 6px; font-size: 11.5px; color: var(--muted); }

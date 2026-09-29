@@ -69,6 +69,8 @@
           <span><i class="sw overlap"></i>重叠</span>
           <span><i class="sw event"></i>连续性事件</span>
           <span><i class="sw closure"></i>水深交点</span>
+          <span><i class="sw ray"></i>射线落点</span>
+          <span><i class="sw ray-straight"></i>直线对照</span>
         </div>
         <div class="canvas-hint">滚轮缩放 · 拖拽平移 · 双击复位 · 点击问题卡片定位</div>
       </div>
@@ -198,6 +200,69 @@
           <table id="cl-line-biases" class="line-stats"></table>
           <div id="cl-components"></div>
         </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel ray-panel">
+    <div class="panel-title">
+      <h2>声速射线改正</h2>
+      <div class="btn-row">
+        <button id="btn-rc-sample" type="button">载入示例</button>
+        <button id="btn-rc-run" type="button" class="primary">开始改正</button>
+        <button id="btn-rc-export" type="button" disabled>导出结果 JSON</button>
+      </div>
+    </div>
+    <p class="ct-note">
+      粘贴<b>分层声速剖面</b>（<code>top_depth / bottom_depth / sound_speed</code>，层连续且不重叠、允许断档）
+      与多波束波束（<code>x / y / heading / transducer_depth / two_way_travel_time / angle_deg</code>）。
+      后端取<b>单程时间</b>，以入射层 <code>p = sin(θ)/c</code> 为常量按 Snell 定律逐层累计垂深与横距；
+      heading 自正北顺时针、正角指右舷。遇 <code>|p·c|≥1</code>、剖面断档或时间超过剖面底界时该波束失败并保留已走层段，禁止外推。
+      改正落点（绿点）与入射声速直线对照点（空心菱形）叠加在上方画布，点击卡片定位并在下方查看射线路径剖面图。
+    </p>
+    <div class="ct-grid">
+      <div class="ct-input-col">
+        <label class="rc-label">声速剖面 JSON（层数组，或含 <code>profile</code> 的对象）</label>
+        <textarea id="rc-profile" spellcheck="false" class="rc-area"
+          placeholder='[{"top_depth": 0, "bottom_depth": 15, "sound_speed": 1500.0}, …]'></textarea>
+        <label class="rc-label">波束 JSON（数组，或含 <code>beams</code> 的对象）</label>
+        <textarea id="rc-beams" spellcheck="false" class="rc-area rc-beams"
+          placeholder='[{"x":500,"y":500,"heading":90,"transducer_depth":5,"two_way_travel_time":0.1,"angle_deg":30}, …]'></textarea>
+        <div id="rc-status" class="status"></div>
+        <details class="help">
+          <summary>格式与射线追踪规则</summary>
+          <pre>{
+  "profile": [
+    { "top_depth": 0, "bottom_depth": 15, "sound_speed": 1500.0 },
+    { "top_depth": 15, "bottom_depth": 50, "sound_speed": 1480.0 }
+  ],
+  "beams": [
+    { "id": "B-001", "x": 500, "y": 500, "heading": 90,
+      "transducer_depth": 5, "two_way_travel_time": 0.16,
+      "angle_deg": 30.0 }
+  ]
+}</pre>
+          <ul>
+            <li>剖面层 <b>连续且不重叠</b>（端点相接允许）；层间留空视为<b>断档</b>，射线进入断档时该波束失败，禁止外推；层顺序随意，后端按 top_depth 排序。</li>
+            <li>双程时间取一半：<code>t = two_way_travel_time / 2</code>；射线参数 <code>p = sin(θ₀)/c₀</code>（入射层）全程常量。</li>
+            <li>层内：<code>sin θ = p·c</code>，<code>垂深耗时 dz/(c·cos θ)</code>，<code>横距 dz·tan θ</code>；换能器位于层中部时首段按部分厚度计算。</li>
+            <li>heading 自正北顺时针（度），正角指右舷：落点 <code>x = x₀ + cross·cos h</code>，<code>y = y₀ − cross·sin h</code>。</li>
+            <li>失败三类：<code>refraction_limit</code>（|p·c| ≥ 1，全反射/临界折射）、<code>profile_gap</code>（换能器不在层内或层间断档）、<code>beyond_profile_bottom</code>（时间超过最深层底界）；失败保留已走层段、耗时与位移，但不外推落点。</li>
+            <li>每个波束同时给出以入射声速沿入射方向<b>直线传播</b>的对照落点及与改正落点的偏差。</li>
+          </ul>
+        </details>
+      </div>
+      <div class="ct-result-col">
+        <div id="rc-summary" class="summary"></div>
+        <div class="filter-bar" id="rc-status-filter"></div>
+        <div id="rc-list" class="issue-list"></div>
+        <div class="rc-rayview-wrap" id="rc-rayview-wrap" hidden>
+          <div class="panel-title">
+            <h2 id="rc-rayview-title">射线路径剖面</h2>
+          </div>
+          <canvas id="rc-rayview"></canvas>
+          <div class="rc-rayview-hint">横轴：有符号横距 cross-track（右舷为正） · 纵轴：垂深（向下为正） · 绿=Snell 改正射线 · 橙虚线=入射声速直线对照 · 灰带=声速层 · 红段=断档</div>
+        </div>
       </div>
     </div>
   </section>

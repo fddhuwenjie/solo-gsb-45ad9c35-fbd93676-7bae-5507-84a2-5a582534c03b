@@ -17,6 +17,12 @@
 按里程线性插值交点水深，以交点水深差建立偏置方程网，用 NumPy Huber 迭代加权最小二乘
 估计各测线偏置并判定闭合异常（详见下文）。
 
+复核页再下方另有 **声速射线改正** 面板：给出分层声速剖面（连续、不重叠、允许断档）与
+多波束波束（位置/航向/换能器深度/双程传播时间/相对垂直方向的有符号入射角），
+取单程时间并以入射层射线参数 `p = sin(θ)/c` 为 Snell 常量逐层追踪，输出改正落点、
+各层角度/耗时/位移、射线路径以及入射声速直线传播对照值；遇折射极限、剖面断档或时间
+超过剖面底界时该波束失败并保留已走层段，禁止外推（详见下文）。
+
 技术栈：Python FastAPI + Shapely(GEOS) + NumPy 后端，原生 JavaScript（零依赖）前端。
 
 ## 快速开始（一条命令）
@@ -25,7 +31,7 @@
 docker compose up --build
 ```
 
-然后访问 <http://localhost:8000> 。页面自动载入示例数据并完成首次复核与连续性检查。
+然后访问 <http://localhost:8000> 。页面自动载入示例数据并完成首次复核、连续性检查与声速射线改正（水深闭合面板可点“载入示例”）。
 
 > 也可以 `docker build -t sonar-review . && docker run -p 8000:8000 sonar-review`。
 
@@ -175,6 +181,66 @@ IRLS 迭代次数、收敛情况与残差 RMS；`line_biases` 给出逐测线偏
 点击卡片在画布定位并高亮；**导出结果 JSON** 下载完整响应；样本或参数修改后约 0.7s 自动重新闭合，
 任务输入中的计划测线变化后也会自动重算。
 
+## 声速射线改正
+
+页面 **声速射线改正** 面板：左侧分别粘贴 **分层声速剖面** 与 **波束** 两段 JSON
+（数组，或含 `profile` / `beams` 数组的对象），点 **开始改正**（修改后约 0.7s 自动重算）。
+示例剖面在 300–320 m 间故意留有断档，并覆盖成功与全部三类失败波束。
+
+```json
+{
+  "profile": [
+    { "top_depth": 0, "bottom_depth": 15, "sound_speed": 1500.0 },
+    { "top_depth": 15, "bottom_depth": 50, "sound_speed": 1480.0 }
+  ],
+  "beams": [
+    { "id": "B-001", "x": 500, "y": 500, "heading": 90,
+      "transducer_depth": 5, "two_way_travel_time": 0.16, "angle_deg": 30.0 }
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `profile[].top_depth/bottom_depth` | 层顶/层底深度（自海表面向下为正），层厚必须为正；层间不得重叠（整体 400 拒绝），端点相接允许 |
+| `profile[].sound_speed` | 该层内恒定声速（长度/秒，与坐标长度单位一致），必须为正 |
+| `beams[].id` | 可选波束编号；缺省按输入顺序生成 B-001… |
+| `x / y` | 换能器平面坐标 |
+| `heading` | 航向角（度，自正北顺时针） |
+| `transducer_depth` | 换能器深度（向下为正；必须落在某一层内，否则该波束失败） |
+| `two_way_travel_time` | 双程传播时间（秒）；后端取一半 `t = twtt/2` 作为单程时间 |
+| `angle_deg` | 相对垂直方向的有符号入射角（度，−90…90），**正角指右舷** |
+
+**射线追踪规则**（波束按 0-based 原始输入顺序处理，不重排）：
+
+1. **入射层与射线参数**：取换能器深度所在层（位于相接界面时归属下方层）的声速 `c₀`
+   与入射角 `θ₀`，计算 Snell 常量 `p = sin(θ₀)/c₀`，全程不变。
+2. **逐层累计**：在声速 `c` 的层内 `sin θ = p·c`、`cos θ = √(1−(p·c)²)`；
+   穿过垂深 `dz` 的单程耗时 `dt = dz/(c·cos θ)`，有符号横距 `dx = dz·tan θ`
+   （`tan θ = p·c/√(1−(p·c)²)`）。换能器位于层中部时首段只走部分厚度；
+   单程时间在某层内耗尽时该层同样只走部分厚度。
+3. **平面落点**：正角指向右舷，右舷方位 = `heading + 90°`：
+   `footprint.x = x + cross·cos(heading)`、`footprint.y = y − cross·sin(heading)`。
+4. **失败（禁止外推，已走层段全部保留，不输出落点）**：
+   - `refraction_limit`：入射层或任一界面处 `|p·c| ≥ 1`（全反射/临界折射）；
+   - `profile_gap`：换能器深度不在任何层内，或某层底与下一层顶之间存在深度空缺（断档）；
+   - `beyond_profile_bottom`：穿过最深层底后仍有剩余单程时间。
+5. **直线对照**：只要能确定入射声速，就同时给出以 `c₀` 沿入射方向直线传播
+   距离 `c₀·t` 的对照落点、对照垂深/横距，以及与改正落点的平面偏差 `deviation`。
+
+**结果内容**：`summary`（波束数、成功/失败数、三类失败计数、剖面顶底深、最大对照偏差）、
+`profile`（按顶深排序后的层，`layer_index` 为原始输入序号）、`beams[]`（状态、射线参数 `p`、
+改正落点 `point`、落点深度、累计垂深/横距/单程耗时与剩余时间；`segments[]` 逐层给出
+层序号/声速/层内角度（sin/cos）/进入离开深度/垂深/横距/路径长/层内耗时/累计耗时/是否完整层；
+失败波束给出 `failure_reason/failure_message`、已到达深度与已走层段；`straight` 直线对照；
+`ray_path.coordinates` 为 `[横距, 垂深]` 剖面折线）、`meta`（剖面/追踪/失败/平面换算规则文字）。
+同一输入输出逐字节一致。
+
+**页面操作**：波束可按 **状态**（全部/成功/失败/折射极限/剖面断档/超底界）筛选（计数）；
+成功波束以绿色实心圆、直线对照以橙色空心菱形叠加在上方画布（含换能器→落点连线），
+失败波束在换能器处标红叉；点击卡片在画布定位，并在下方 **射线路径剖面图** 中绘制
+声速层带、断档红条、绿色 Snell 折线路径与橙色虚线直线对照；**导出结果 JSON** 下载完整响应。
+
 ## API
 
 | 接口 | 说明 |
@@ -186,11 +252,14 @@ IRLS 迭代次数、收敛情况与残差 RMS；`line_biases` 给出逐测线偏
 | `POST /api/continuity` | 采集连续性检查，请求体 `{"lines": [...], "samples": [...], "options": {...}}` |
 | `GET /api/closure/sample` | 交叉点水深闭合示例数据（task 可载入任务输入，另含 lines/samples/options） |
 | `POST /api/closure` | 交叉点水深闭合，请求体 `{"lines": [...], "samples": [...depth...], "options": {...}}` |
+| `GET /api/ray-correction/sample` | 声速射线改正式例数据（profile + beams，含成功与三类失败波束） |
+| `POST /api/ray-correction` | 声速射线改正，请求体 `{"profile": [...top/bottom/sound_speed...], "beams": [...x/y/heading/transducer_depth/two_way_travel_time/angle_deg...]}` |
 | `GET /docs` | FastAPI 自动交互文档 |
 
 响应：`summary`（面积/覆盖率/问题计数）、`issues`（含 `basis` 计算依据）、`line_stats`（逐测线统计）、`geometries.coverage`（覆盖并集，用于绘图）、`meta`（引擎版本与约定）。页面 **导出结果 JSON** 按钮下载的即该响应。
 连续性接口响应：`summary`（样本/事件计数、各原因计数、未知测线）、`events`（起止样本、原始索引、原因、轨迹几何、阈值与计算量、逐区间明细）、`line_stats`（逐测线样本/事件统计）、`meta`（判定规则与索引约定）。
 水深闭合接口响应：`summary`（点状交点/有效交点计数、正常/异常/不可判计数、跳过分类计数、连通分量数）、`intersections`（插值端点与比例、原始闭合差、最终权重、偏置、校正残差、状态）、`skips`（重叠线/缺有效包围样本/未知测线及原因）、`components`（锚线、节点/观测数、冗余度、Huber 迭代与收敛、残差 RMS）、`line_biases`（逐测线偏置）、`meta`（交点/包围/平差规则与编号约定）。
+声速射线改正接口响应：`summary`（波束/成功/失败/三类失败计数、剖面顶底深、最大对照偏差）、`profile`（按顶深排序的层）、`beams`（改正落点、逐层角度/耗时/位移、射线参数、已走层段、失败原因、射线路径与入射声速直线对照）、`meta`（剖面/追踪/失败/平面换算规则与编号约定）。
 
 ## 页面功能
 
@@ -201,7 +270,9 @@ IRLS 迭代次数、收敛情况与残差 RMS；`line_biases` 给出逐测线偏
 - 复核结果一键导出 JSON；
 - 采集连续性面板：样本粘贴 + 三阈值设置，事件按测线/原因组合筛选、点击卡片画布定位、结果导出 JSON；
 - 交叉点水深闭合面板：含 depth 样本粘贴 + 包围距离/Huber δ/残差阈值设置，交点按状态/测线组合筛选、
-  点击卡片画布定位（有效交点彩色圆点、跳过点橙色虚线圈）、测线偏置与连通分量表、结果导出 JSON。
+  点击卡片画布定位（有效交点彩色圆点、跳过点橙色虚线圈）、测线偏置与连通分量表、结果导出 JSON；
+- 声速射线改正面板：声速剖面 + 波束粘贴，波束按状态/失败原因筛选，改正落点与直线对照叠加画布、
+  失败波束红叉，点击卡片查看横距-垂深射线路径剖面图（声速层带/断档/Snell 折线/直线对照）、结果导出 JSON。
 
 ## 目录结构
 
@@ -211,12 +282,14 @@ app/
   analysis.py        Shapely 几何复核核心
   continuity.py      采集连续性检查核心
   closure.py         交叉点水深闭合核心（交点插值 + NumPy Huber IRLS）
+  ray_correction.py  声速射线改正核心（分层剖面 Snell 逐层追踪 + 直线对照）
   schemas.py         Pydantic 请求模型
-  sample.py          示例任务、连续性与水深闭合样本数据
+  sample.py          示例任务、连续性、水深闭合与声速射线改正样本数据
   static/            前端（index.html / app.js / style.css）
 tests/
   test_analysis.py   覆盖复核核心计算冒烟测试
   test_continuity.py 采集连续性检查测试
   test_closure.py    交叉点水深闭合测试
+  test_ray_correction.py 声速射线改正测试
 Dockerfile / docker-compose.yml / requirements.txt
 ```

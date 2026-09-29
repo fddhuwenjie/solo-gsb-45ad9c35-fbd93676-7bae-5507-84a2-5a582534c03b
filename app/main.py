@@ -10,18 +10,25 @@ from fastapi.staticfiles import StaticFiles
 from .analysis import analyze
 from .closure import check_closure
 from .continuity import check_continuity
-from .sample import CLOSURE_SAMPLE, CONTINUITY_SAMPLE, SAMPLE
-from .schemas import AnalysisRequest, ClosureRequest, ContinuityRequest
+from .ray_correction import ray_correct
+from .sample import CLOSURE_SAMPLE, CONTINUITY_SAMPLE, RAY_SAMPLE, SAMPLE
+from .schemas import (
+    AnalysisRequest,
+    ClosureRequest,
+    ContinuityRequest,
+    RayCorrectionRequest,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(
     title="水下声呐测线覆盖复核",
-    version="1.2.0",
+    version="1.3.0",
     description="粘贴任务边界与测线 JSON，复核覆盖缺口、越界扫掠与相邻测线过度重叠；"
                 "并可对按采集顺序排列的样本做采集连续性检查（时间/序号/间隔/速度/偏离），"
-                "以及交叉点水深闭合（交点插值 + Huber IRLS 测线偏置估计）。",
+                "交叉点水深闭合（交点插值 + Huber IRLS 测线偏置估计），"
+                "以及分层声速剖面下的多波束声速射线改正（Snell 逐层追踪）。",
 )
 
 
@@ -75,6 +82,22 @@ def api_closure(req: ClosureRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - 几何/平差对异常输入的报错也转为 400
+        raise HTTPException(status_code=400, detail=f"计算失败: {exc}") from exc
+
+
+@app.get("/api/ray-correction/sample")
+def api_ray_sample() -> dict:
+    """返回声速射线改正式例数据（profile + beams）。"""
+    return RAY_SAMPLE
+
+
+@app.post("/api/ray-correction")
+def api_ray_correction(req: RayCorrectionRequest) -> dict:
+    try:
+        return ray_correct(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - 射线追踪对异常输入的报错也转为 400
         raise HTTPException(status_code=400, detail=f"计算失败: {exc}") from exc
 
 

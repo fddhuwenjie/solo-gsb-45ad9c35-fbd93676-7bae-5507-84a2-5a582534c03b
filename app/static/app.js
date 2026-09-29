@@ -267,6 +267,8 @@ function draw() {
       ctx.setLineDash([]);
     }
   }
+  // 声速射线改正：换能器→落点线、改正落点、直线对照点、失败波束红叉
+  drawRcOverlay();
 }
 
 function hexA(hex, alpha) {
@@ -310,6 +312,20 @@ function fitToAll() {
   if (lastInput && lastInput.boundary) geomBBox(lastInput.boundary, bbox);
   if (lastResult && lastResult.geometries.coverage) geomBBox(lastResult.geometries.coverage, bbox);
   if (ctResult) for (const ev of ctResult.events) lineGeomBBox(ev.geometry, bbox);
+  if (rcResult) {
+    for (const b of rcResult.beams) {
+      bbox[0] = Math.min(bbox[0], b.x); bbox[1] = Math.min(bbox[1], b.y);
+      bbox[2] = Math.max(bbox[2], b.x); bbox[3] = Math.max(bbox[3], b.y);
+      if (b.point) {
+        bbox[0] = Math.min(bbox[0], b.point[0]); bbox[1] = Math.min(bbox[1], b.point[1]);
+        bbox[2] = Math.max(bbox[2], b.point[0]); bbox[3] = Math.max(bbox[3], b.point[1]);
+      }
+      if (b.straight) {
+        bbox[0] = Math.min(bbox[0], b.straight.point[0]); bbox[1] = Math.min(bbox[1], b.straight.point[1]);
+        bbox[2] = Math.max(bbox[2], b.straight.point[0]); bbox[3] = Math.max(bbox[3], b.straight.point[1]);
+      }
+    }
+  }
   if (bbox[0] === Infinity) return;
   fitBounds(bbox);
   draw();
@@ -1152,4 +1168,485 @@ for (const id of ["#cl-max-enclosure", "#cl-huber-delta", "#cl-residual"]) {
 /* ---------------- 闭合面板初始化：不抢占上方任务示例，待用户载入示例或粘贴样本 ---------------- */
 (function initClosure() {
   clSetStatus("粘贴含 depth 的样本后自动闭合，或点“载入示例”载入配套网格任务演示");
+})();
+
+/* ================= 声速射线改正 ================= */
+const rcProfileEl = $("#rc-profile");
+const rcBeamsEl = $("#rc-beams");
+const rcStatusEl = $("#rc-status");
+const rcSummaryEl = $("#rc-summary");
+const rcStatusFilterEl = $("#rc-status-filter");
+const rcListEl = $("#rc-list");
+const rcExportBtn = $("#btn-rc-export");
+const rcRayViewWrap = $("#rc-rayview-wrap");
+const rcRayViewTitle = $("#rc-rayview-title");
+const rcRayCanvas = $("#rc-rayview");
+const rcRayCtx = rcRayCanvas.getContext("2d");
+
+const RC_COLOR = "#3fb950";
+const RC_STRAIGHT_COLOR = "#f5a524";
+const RC_FAIL_COLOR = "#e5484d";
+const RC_REASON_LABEL = {
+  refraction_limit: "折射极限",
+  profile_gap: "剖面断档",
+  beyond_profile_bottom: "超过剖面底界",
+};
+
+let rcResult = null;
+let rcFilter = "all";        // all / ok / failed / <failure_reason>
+let selectedBeamId = null;
+let rcTimer = null;
+
+function rcSetStatus(msg, isErr) {
+  rcStatusEl.textContent = msg;
+  rcStatusEl.classList.toggle("err", !!isErr);
+}
+
+function rcParseBox(text, arrayName) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`${arrayName} JSON 解析失败：${err.message}`);
+  }
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && Array.isArray(parsed[arrayName])) return parsed[arrayName];
+  throw new Error(`${arrayName} JSON 必须是数组，或含 ${arrayName} 数组的对象`);
+}
+
+function rcBeamVisible(b) {
+  if (rcFilter === "all") return true;
+  if (rcFilter === "ok") return b.status === "ok";
+  if (rcFilter === "failed") return b.status === "failed";
+  return b.status === "failed" && b.failure_reason === rcFilter;
+}
+
+async function runRayCorrection(silent) {
+  let profile, beams;
+  try {
+    profile = rcParseBox(rcProfileEl.value, "profile");
+    beams = rcParseBox(rcBeamsEl.value, "beams");
+  } catch (err) {
+    rcSetStatus(err.message, true);
+    return;
+  }
+  rcSetStatus("射线改正计算中…");
+  try {
+    const resp = await fetch("/api/ray-correction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile, beams }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(errDetail(data, resp.status));
+    rcResult = data;
+    const s = data.summary;
+    const fc = s.failure_counts;
+    rcSetStatus(`改正完成：${s.beam_count} 个波束，成功 ${s.ok_count}、失败 ${s.failed_count}` +
+      (s.failed_count ? `（折射极限 ${fc.refraction_limit} / 断档 ${fc.profile_gap} / 超底界 ${fc.beyond_profile_bottom}）` : "") +
+      (s.max_deviation != null ? `；与直线对照最大偏差 ${s.max_deviation}` : ""));
+    renderRcAll();
+  } catch (err) {
+    rcSetStatus(`改正失败：${err.message}`, true);
+    if (!silent) rcListEl.innerHTML = `<div class="empty-note">改正失败：${esc(err.message)}</div>`;
+  }
+}
+
+function renderRcAll() {
+  renderRcSummary();
+  renderRcFilter();
+  renderRcList();
+  rcExportBtn.disabled = !rcResult;
+  if (selectedBeamId && !rcResult.beams.some(b => b.id === selectedBeamId)) {
+    selectedBeamId = null;
+  }
+  // 结果刷新时仅在已展开的情况下重绘剖面图；展开/滚动由用户点击卡片触发
+  rcRayViewWrap.hidden = !(selectedBeamId && rcResult.beams.some(b => b.id === selectedBeamId));
+  if (!rcRayViewWrap.hidden) drawRcRayView();
+  draw();
+}
+
+function renderRcSummary() {
+  const s = rcResult.summary, fc = s.failure_counts;
+  rcSummaryEl.innerHTML = [
+    statCard("波束总数", s.beam_count),
+    statCard("改正成功", s.ok_count, s.ok_count ? "good" : ""),
+    statCard("失败", s.failed_count, s.failed_count ? "bad" : "good"),
+    statCard("折射极限", fc.refraction_limit, fc.refraction_limit ? "warn" : "good"),
+    statCard("剖面断档", fc.profile_gap, fc.profile_gap ? "warn" : "good"),
+    statCard("超剖面底界", fc.beyond_profile_bottom, fc.beyond_profile_bottom ? "warn" : "good"),
+    statCard("最大对照偏差", s.max_deviation == null ? "—" : s.max_deviation),
+  ].join("");
+}
+
+function renderRcFilter() {
+  const s = rcResult.summary, fc = s.failure_counts;
+  const defs = [
+    ["all", "全部", s.beam_count],
+    ["ok", "成功", s.ok_count],
+    ["failed", "失败", s.failed_count],
+    ["refraction_limit", "折射极限", fc.refraction_limit],
+    ["profile_gap", "剖面断档", fc.profile_gap],
+    ["beyond_profile_bottom", "超底界", fc.beyond_profile_bottom],
+  ];
+  rcStatusFilterEl.innerHTML = defs.map(([k, label, n]) =>
+    `<button data-f="${k}" class="${rcFilter === k ? "active" : ""}">${label}<span class="cnt">${n}</span></button>`
+  ).join("");
+  rcStatusFilterEl.querySelectorAll("button").forEach(btn =>
+    btn.addEventListener("click", () => {
+      rcFilter = btn.dataset.f;
+      renderRcFilter();
+      renderRcList();
+      draw();
+    }));
+}
+
+function rcSegRows(b) {
+  if (!b.segments.length) {
+    return `<tr><td colspan="9">${b.status === "failed" ? "无已走层段" : "—"}</td></tr>`;
+  }
+  return b.segments.map(seg => `
+    <tr class="${seg.complete_layer ? "" : "partial"}">
+      <td>#${seg.layer_index}${seg.complete_layer ? "" : "（部分段）"}</td>
+      <td>${seg.sound_speed}</td>
+      <td>${seg.angle_deg}°</td>
+      <td>${seg.enter_depth} → ${seg.exit_depth}</td>
+      <td>${seg.vertical}</td>
+      <td>${seg.cross_track}</td>
+      <td>${seg.path_length}</td>
+      <td>${seg.travel_time}</td>
+      <td>${seg.elapsed_one_way_time}</td>
+    </tr>`).join("");
+}
+
+function renderRcList() {
+  const beams = rcResult.beams.filter(rcBeamVisible);
+  if (!beams.length) {
+    rcListEl.innerHTML = `<div class="empty-note">当前筛选条件下没有波束。</div>`;
+    return;
+  }
+  rcListEl.innerHTML = beams.map(b => {
+    const ok = b.status === "ok";
+    const reasonChip = ok ? "" : `<span class="chip rc-reason">${esc(RC_REASON_LABEL[b.failure_reason] || b.failure_reason)}</span>`;
+    const pointTxt = ok ? `[${b.point.join(", ")}]` : "—（未外推）";
+    const depthTxt = ok ? b.footprint_depth : `已至 ${b.reached_depth}`;
+    return `
+    <div class="issue-card rc-${b.status} ${b.id === selectedBeamId ? "selected" : ""}" data-id="${esc(b.id)}">
+      <div class="issue-head">
+        <span class="id">${esc(b.id)}</span>
+        <span class="chip ${ok ? "rc-ok" : "rc-failed"}">${esc(b.status_label)}</span>
+        ${reasonChip}
+        <span class="chip line">θ=${b.angle_deg}°</span>
+        <span class="chip line">h=${b.heading}°</span>
+      </div>
+      <div class="issue-meta">
+        <span>换能器 <b>[${b.x}, ${b.y}] @ ${b.transducer_depth}</b></span>
+        <span>双程/单程 <b>${b.two_way_travel_time} / ${b.one_way_travel_time} s</b></span>
+        <span>落点深 <b>${depthTxt}</b></span>
+        <span>横距 <b>${ok ? b.cross_track : `已走 ${b.cross_track_traveled}`}</b></span>
+        <span>改正落点 <b>${pointTxt}</b></span>
+        <span>已耗/剩余 <b>${b.elapsed_one_way_time} / ${b.remaining_one_way_time} s</b></span>
+        ${ok ? `<span>对照偏差 <b>${b.deviation}</b></span>` : ""}
+      </div>
+      ${ok ? "" : `<div class="basis"><div class="method">${esc(b.failure_message || "")}</div></div>`}
+      <details>
+        <summary>逐层射线路径 / 直线对照（可复核）</summary>
+        <div class="basis">
+          <div class="method">${esc(rcResult.meta.ray_rule)}</div>
+          <table class="rc-seg-table">
+            <tr><th>层</th><th>声速</th><th>层内角度</th><th>进入→离开深度</th><th>垂深</th><th>横距</th><th>路径长</th><th>层内耗时</th><th>累计单程耗时</th></tr>
+            ${rcSegRows(b)}
+          </table>
+          ${b.straight ? `<div class="method">直线对照（入射声速 ${b.straight.sound_speed}）：路径长 ${b.straight.path_length}，垂深 ${b.straight.vertical}，横距 ${b.straight.cross_track}，对照深 ${b.straight.footprint_depth}，对照点 [${b.straight.point.join(", ")}]${ok ? `，与改正落点偏差 ${b.deviation}` : ""}</div>`
+            : `<div class="method">换能器不在任何声速层内，无法确定入射声速，直线对照不可计算。</div>`}
+          ${b.ray_parameter_p != null ? `<div class="method">射线参数 p = ${b.ray_parameter_p}（snell 常量）</div>` : ""}
+        </div>
+      </details>
+    </div>`;
+  }).join("");
+
+  rcListEl.querySelectorAll(".issue-card").forEach(card =>
+    card.addEventListener("click", (e) => {
+      if (e.target.closest("details")) return;
+      selectBeam(card.dataset.id, true);
+    }));
+}
+
+function selectBeam(id, panTo) {
+  selectedBeamId = id;
+  rcListEl.querySelectorAll(".issue-card").forEach(c =>
+    c.classList.toggle("selected", c.dataset.id === id));
+  if (panTo) {
+    const b = rcResult.beams.find(x => x.id === id);
+    if (b) {
+      const pt = b.point || (b.straight ? b.straight.point : [b.x, b.y]);
+      const pad = 40;
+      fitBounds([pt[0] - pad, pt[1] - pad, pt[0] + pad, pt[1] + pad]);
+      draw();
+    }
+    rcRayViewWrap.hidden = false;
+    drawRcRayView();
+    rcRayViewWrap.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+}
+
+/* ---------------- 主画布叠加：改正落点 + 直线对照点 ---------------- */
+function drawRcOverlay() {
+  if (!rcResult) return;
+  const dpr = window.devicePixelRatio || 1;
+  for (const b of rcResult.beams) {
+    if (!rcBeamVisible(b)) continue;
+    const selected = b.id === selectedBeamId;
+    const [sx0, sy0] = worldToScreen(b.x, b.y);
+    // 换能器 → 落点细线
+    if (b.point) {
+      const [fx, fy] = worldToScreen(b.point[0], b.point[1]);
+      ctx.beginPath();
+      ctx.moveTo(sx0, sy0); ctx.lineTo(fx, fy);
+      ctx.strokeStyle = hexA(RC_COLOR, selected ? 0.95 : 0.45);
+      ctx.lineWidth = (selected ? 2.2 : 1) * dpr;
+      ctx.stroke();
+    }
+    // 改正落点（成功）：实心圆
+    if (b.point) {
+      const [fx, fy] = worldToScreen(b.point[0], b.point[1]);
+      ctx.beginPath();
+      ctx.arc(fx, fy, (selected ? 6.5 : 4.5) * dpr, 0, Math.PI * 2);
+      ctx.fillStyle = RC_COLOR;
+      ctx.fill();
+      ctx.lineWidth = (selected ? 2.2 : 1) * dpr;
+      ctx.strokeStyle = selected ? "#ffffff" : "#0b1119";
+      ctx.stroke();
+    }
+    // 直线对照点：橙色空心菱形
+    if (b.straight) {
+      const [cx, cy] = worldToScreen(b.straight.point[0], b.straight.point[1]);
+      const r = (selected ? 6 : 4.5) * dpr;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - r); ctx.lineTo(cx + r, cy);
+      ctx.lineTo(cx, cy + r); ctx.lineTo(cx - r, cy); ctx.closePath();
+      ctx.strokeStyle = selected ? "#ffffff" : RC_STRAIGHT_COLOR;
+      ctx.lineWidth = (selected ? 2.2 : 1.4) * dpr;
+      ctx.stroke();
+    }
+    // 失败波束：换能器处红叉
+    if (!b.point) {
+      const r = (selected ? 6 : 4.5) * dpr;
+      ctx.beginPath();
+      ctx.moveTo(sx0 - r, sy0 - r); ctx.lineTo(sx0 + r, sy0 + r);
+      ctx.moveTo(sx0 + r, sy0 - r); ctx.lineTo(sx0 - r, sy0 + r);
+      ctx.strokeStyle = RC_FAIL_COLOR;
+      ctx.lineWidth = (selected ? 2.5 : 1.6) * dpr;
+      ctx.stroke();
+    }
+    if (selected) {
+      const lp = b.point || (b.straight ? b.straight.point : [b.x, b.y]);
+      const [lx, ly] = worldToScreen(lp[0], lp[1]);
+      ctx.fillStyle = "#fff";
+      ctx.font = `bold ${13 * dpr}px Consolas, monospace`;
+      ctx.fillText(b.id, lx + 9, ly - 7);
+    }
+  }
+}
+
+/* ---------------- 射线路径剖面图（横距-垂深） ---------------- */
+function rcResizeRayCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = rcRayCanvas.clientWidth, h = rcRayCanvas.clientHeight;
+  if (rcRayCanvas.width !== Math.round(w * dpr) || rcRayCanvas.height !== Math.round(h * dpr)) {
+    rcRayCanvas.width = Math.round(w * dpr);
+    rcRayCanvas.height = Math.round(h * dpr);
+  }
+  return { dpr, w, h };
+}
+
+function drawRcRayView() {
+  if (!rcResult || !selectedBeamId) return;
+  const { dpr, w, h } = rcResizeRayCanvas();
+  const c = rcRayCtx;
+  c.clearRect(0, 0, rcRayCanvas.width, rcRayCanvas.height);
+  const b = rcResult.beams.find(x => x.id === selectedBeamId);
+  if (!b) return;
+  rcRayViewTitle.textContent = `射线路径剖面 — ${b.id}（${b.status_label}${b.status === "failed" ? " · " + RC_REASON_LABEL[b.failure_reason] : ""}）`;
+
+  const padL = 56 * dpr, padR = 110 * dpr, padT = 16 * dpr, padB = 34 * dpr;
+  const z0 = b.transducer_depth;
+  const profile = rcResult.profile;
+  let zMin = Math.min(0, z0), zMax = rcResult.summary.profile_bottom;
+  let xMin = 0, xMax = 0;
+  for (const q of b.ray_path.coordinates) {
+    xMin = Math.min(xMin, q[0]); xMax = Math.max(xMax, q[0]);
+  }
+  if (b.straight) {
+    xMin = Math.min(xMin, b.straight.cross_track);
+    xMax = Math.max(xMax, b.straight.cross_track);
+    zMax = Math.max(zMax, b.straight.footprint_depth);
+  }
+  zMax = Math.max(zMax, b.reached_depth);
+  if (xMin === xMax) { xMin -= 5; xMax += 5; }
+  const padX = (xMax - xMin) * 0.08, padZ = (zMax - zMin) * 0.06 + 1e-9;
+  xMin -= padX; xMax += padX; zMin = Math.max(0, zMin - padZ); zMax += padZ;
+
+  const X = (cross) => padL + (cross - xMin) / (xMax - xMin) * (w * dpr - padL - padR);
+  const Y = (z) => padT + (z - zMin) / (zMax - zMin) * (h * dpr - padT - padB);
+
+  // 声速层带 + 断档红条
+  const plotW = w * dpr - padL - padR;
+  for (let i = 0; i < profile.length; i++) {
+    const ly = profile[i];
+    const yt = Y(Math.max(ly.top_depth, zMin)), yb = Y(Math.min(ly.bottom_depth, zMax));
+    c.fillStyle = i % 2 === 0 ? "rgba(63,185,80,0.07)" : "rgba(125,179,255,0.06)";
+    c.fillRect(padL, yt, plotW, Math.max(0, yb - yt));
+    c.strokeStyle = "rgba(120,150,180,0.35)";
+    c.lineWidth = 1 * dpr;
+    c.beginPath(); c.moveTo(padL, yb); c.lineTo(padL + plotW, yb); c.stroke();
+    c.fillStyle = "rgba(139,161,184,0.9)";
+    c.font = `${11 * dpr}px Consolas, monospace`;
+    c.fillText(`#${ly.layer_index} c=${ly.sound_speed}`, padL + plotW + 8 * dpr, yt + 13 * dpr);
+  }
+  for (let i = 1; i < profile.length; i++) {
+    const gapTop = profile[i - 1].bottom_depth, gapBottom = profile[i].top_depth;
+    if (gapBottom - gapTop > 1e-9) {
+      const yt = Y(gapTop), yb = Y(Math.min(gapBottom, zMax));
+      if (yb > yt) {
+        c.fillStyle = "rgba(229,72,77,0.18)";
+        c.fillRect(padL, yt, plotW, Math.min(yb, padT + (h * dpr - padT - padB)) - yt);
+        c.fillStyle = "#ffb4b6";
+        c.font = `${10.5 * dpr}px sans-serif`;
+        c.fillText("断档（禁止外推）", padL + 8 * dpr, (yt + yb) / 2 + 3 * dpr);
+      }
+    }
+  }
+
+  // 坐标轴 / 网格
+  c.strokeStyle = "rgba(120,150,180,0.25)";
+  c.fillStyle = "rgba(139,161,184,0.85)";
+  c.lineWidth = 1 * dpr;
+  c.font = `${10.5 * dpr}px Consolas, monospace`;
+  const zStep = niceStep((zMax - zMin) / 6);
+  for (let z = Math.ceil(zMin / zStep) * zStep; z <= zMax + 1e-9; z += zStep) {
+    const y = Y(z);
+    c.beginPath(); c.moveTo(padL, y); c.lineTo(padL + plotW, y); c.stroke();
+    c.fillText(String(Math.round(z * 100) / 100), 8 * dpr, y + 3 * dpr);
+  }
+  const xStep = niceStep((xMax - xMin) / 6);
+  for (let x = Math.ceil(xMin / xStep) * xStep; x <= xMax + 1e-9; x += xStep) {
+    const sx = X(x);
+    c.beginPath(); c.moveTo(sx, padT); c.lineTo(sx, padT + (h * dpr - padT - padB)); c.stroke();
+    c.fillText(String(Math.round(x * 100) / 100), sx - 12 * dpr, padT + (h * dpr - padT - padB) + 16 * dpr);
+  }
+  // cross = 0 纵轴加粗
+  if (xMin < 0 && xMax > 0) {
+    c.strokeStyle = "rgba(200,220,240,0.5)";
+    c.beginPath(); c.moveTo(X(0), padT); c.lineTo(X(0), padT + (h * dpr - padT - padB)); c.stroke();
+  }
+  c.fillStyle = "rgba(200,220,240,0.85)";
+  c.font = `${11 * dpr}px sans-serif`;
+  c.fillText("横距 cross-track（右舷为正）", padL + plotW / 2 - 90 * dpr, h * dpr - 8 * dpr);
+  c.save();
+  c.translate(14 * dpr, padT + (h * dpr - padT - padB) / 2);
+  c.rotate(-Math.PI / 2);
+  c.fillText("垂深（向下）", -40 * dpr, 0);
+  c.restore();
+
+  // 直线对照（橙虚线）：换能器 (0,z0) → (straight.cross, straight.depth)
+  if (b.straight) {
+    c.beginPath();
+    c.moveTo(X(0), Y(z0));
+    c.lineTo(X(b.straight.cross_track), Y(b.straight.footprint_depth));
+    c.setLineDash([6 * dpr, 4 * dpr]);
+    c.strokeStyle = RC_STRAIGHT_COLOR;
+    c.lineWidth = 1.8 * dpr;
+    c.stroke();
+    c.setLineDash([]);
+    const dx = X(b.straight.cross_track), dy = Y(b.straight.footprint_depth), r = 5 * dpr;
+    c.beginPath();
+    c.moveTo(dx, dy - r); c.lineTo(dx + r, dy); c.lineTo(dx, dy + r); c.lineTo(dx - r, dy); c.closePath();
+    c.strokeStyle = RC_STRAIGHT_COLOR; c.lineWidth = 1.6 * dpr; c.stroke();
+  }
+
+  // Snell 射线路径（绿折线）
+  const pts = b.ray_path.coordinates;
+  c.beginPath();
+  pts.forEach((q, i) => {
+    const sx = X(q[0]), sy = Y(q[1]);
+    if (i === 0) c.moveTo(sx, sy); else c.lineTo(sx, sy);
+  });
+  c.strokeStyle = b.status === "ok" ? RC_COLOR : RC_FAIL_COLOR;
+  c.lineWidth = 2.2 * dpr;
+  c.stroke();
+  // 换能器起点 + 路径节点
+  pts.forEach((q, i) => {
+    const sx = X(q[0]), sy = Y(q[1]);
+    c.beginPath();
+    c.arc(sx, sy, (i === 0 ? 4 : 3) * dpr, 0, Math.PI * 2);
+    c.fillStyle = i === 0 ? "#ffffff" : (b.status === "ok" ? RC_COLOR : RC_FAIL_COLOR);
+    c.fill();
+  });
+  if (b.status === "ok") {
+    const [ex, ey] = [X(pts[pts.length - 1][0]), Y(pts[pts.length - 1][1])];
+    c.fillStyle = RC_COLOR;
+    c.beginPath(); c.arc(ex, ey, 6 * dpr, 0, Math.PI * 2); c.fill();
+    c.strokeStyle = "#fff"; c.lineWidth = 1.5 * dpr; c.stroke();
+  } else {
+    const [ex, ey] = [X(pts[pts.length - 1][0]), Y(pts[pts.length - 1][1])];
+    const r = 6 * dpr;
+    c.beginPath();
+    c.moveTo(ex - r, ey - r); c.lineTo(ex + r, ey + r);
+    c.moveTo(ex + r, ey - r); c.lineTo(ex - r, ey + r);
+    c.strokeStyle = RC_FAIL_COLOR; c.lineWidth = 2.2 * dpr; c.stroke();
+  }
+
+  // 图例
+  c.font = `${11 * dpr}px sans-serif`;
+  c.fillStyle = RC_COLOR; c.fillText("● Snell 改正射线", padL + 10 * dpr, padT + 4 * dpr);
+  c.fillStyle = RC_STRAIGHT_COLOR; c.fillText("◇ 入射声速直线对照", padL + 150 * dpr, padT + 4 * dpr);
+}
+
+function niceStep(raw) {
+  if (!(raw > 0) || !isFinite(raw)) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  return [1, 2, 5, 10].map(m => m * mag).find(v => v >= raw) || mag * 10;
+}
+
+/* ---------------- 绑定 ---------------- */
+$("#btn-rc-run").addEventListener("click", () => runRayCorrection(false));
+
+$("#btn-rc-sample").addEventListener("click", async () => {
+  const resp = await fetch("/api/ray-correction/sample");
+  const sample = await resp.json();
+  rcProfileEl.value = JSON.stringify(sample.profile, null, 2);
+  rcBeamsEl.value = JSON.stringify(sample.beams, null, 2);
+  runRayCorrection(false);
+});
+
+rcExportBtn.addEventListener("click", () => {
+  if (!rcResult) return;
+  const blob = new Blob([JSON.stringify(rcResult, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "ray-correction-result.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+function rcAutoRun() {
+  clearTimeout(rcTimer);
+  rcTimer = setTimeout(() => runRayCorrection(true), 700);
+}
+rcProfileEl.addEventListener("input", rcAutoRun);
+rcBeamsEl.addEventListener("input", rcAutoRun);
+window.addEventListener("resize", () => { if (rcResult) drawRcRayView(); });
+
+/* ---------------- 初始化：载入示例并改正 ---------------- */
+(async function initRayCorrection() {
+  try {
+    const resp = await fetch("/api/ray-correction/sample");
+    const sample = await resp.json();
+    rcProfileEl.value = JSON.stringify(sample.profile, null, 2);
+    rcBeamsEl.value = JSON.stringify(sample.beams, null, 2);
+    await runRayCorrection(true);
+  } catch (err) {
+    rcSetStatus(`初始化失败：${err.message}`, true);
+  }
 })();
